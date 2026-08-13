@@ -1,0 +1,8 @@
+.env
+.env.*
+!.env.example
+.venv/
+reports/
+__pycache__/
+*.pyc
+.claude/
