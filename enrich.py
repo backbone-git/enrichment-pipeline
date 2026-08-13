@@ -21,6 +21,7 @@ import argparse
 import csv
 import json
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass, field
@@ -38,14 +39,14 @@ try:  # load ANTHROPIC_API_KEY from a local .env if present
 except ImportError:
     pass
 
-MODEL = "claude-opus-4-8"  # research() — the judgment-heavy call, kept on Opus
+MODEL = "claude-opus-4-8"  # research_pass1()/research_pass2() — judgment-heavy, kept on Opus
 STRUCTURE_MODEL = "claude-haiku-4-5-20251001"  # structure() — mechanical extraction from an already-written dossier, doesn't need Opus
 REPORTS_DIR = Path("reports")
 
 # A hung request (rare, but seen in practice — one research call ran 20+
 # minutes with no error) shouldn't be able to block a batch or a scheduled
 # pipeline run indefinitely. This bounds every individual request made by
-# the client — not the whole research() loop, which can itself make up to 6
+# the client — not a whole research pass, which can itself make up to 6
 # such requests on pause_turn, so the real worst-case ceiling is several
 # times this number. On timeout, anthropic raises APITimeoutError, which the
 # per-lead try/except in main()/pipeline.py catches so the batch keeps going.
@@ -67,6 +68,29 @@ REQUEST_TIMEOUT_SECONDS = 300.0
 def make_client() -> anthropic.Anthropic:
     timeout = httpx.Timeout(connect=10.0, read=REQUEST_TIMEOUT_SECONDS, write=30.0, pool=10.0)
     return anthropic.Anthropic(timeout=timeout, max_retries=0)
+
+
+# Bias (not a hard filter) toward NZ results — cuts down on wasted
+# disambiguation effort against international namesakes (observed directly:
+# a "Gary Noakes" search surfaced an unrelated financial adviser in
+# Adelaide, Australia, that the model had to spend a search ruling out).
+NZ_LOCATION = {"type": "approximate", "country": "NZ"}
+
+# The known-good NZ real-estate aggregator sites — reliably carry rich,
+# structured agent data (listings, sales history, reviews) in one place when
+# a profile exists, so restricting the first research pass to these is both
+# cheaper and more reliable than an open, undirected search. Deliberately
+# does NOT include agency sites themselves or general search — those matter
+# most for the *current employer* question, which needs pass 2's open
+# search precisely because a very recent agency change may not be reflected
+# on any of these aggregators yet.
+KNOWN_AGENT_SITES = [
+    "trademe.co.nz",
+    "realestate.co.nz",
+    "homes.co.nz",
+    "ratemyagent.co.nz",
+    "oneroof.co.nz",
+]
 
 
 # --------------------------------------------------------------------------- #
@@ -154,38 +178,70 @@ class Evidence(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
-# 3. Research pass — Claude + web search builds a dossier
+# 3. Research — two passes instead of one open-ended call.
+#
+# Live testing showed cost and failure risk scaling with how much real
+# information existed about a lead — exactly backwards, since a
+# well-documented, active agent is the profile we most want to score well.
+# A single open-ended call has to search, disambiguate, verify, and
+# synthesize everything about a person in one unbounded turn, and the more
+# there is to find, the more that turn costs and the more likely it is to
+# time out. Splitting into a cheap, targeted first pass and an optional,
+# narrowly-scoped second pass keeps cheap leads cheap and bounds the
+# expensive work to exactly the one question generic search handles worst.
 # --------------------------------------------------------------------------- #
-RESEARCH_SYSTEM = """You are a research analyst qualifying inbound leads for a real-estate \
-firm that recruits working real-estate agents. You are given a person's contact details \
-from a lead form. Use web search to find out everything you can about them and decide \
-whether they are genuinely a practising real-estate agent.
+RESEARCH_SYSTEM_PASS1 = """You are a research analyst qualifying inbound leads for a real-estate \
+firm that recruits working real-estate agents. You are given a person's contact details from a \
+lead form. Your web search is restricted to the major NZ real-estate aggregator sites (Trade Me \
+Property, realestate.co.nz, homes.co.nz, RateMyAgent, OneRoof) — these reliably carry rich, \
+structured agent data (listings, sales history, reviews) in one place when a profile exists, so \
+this pass should be quick and cheap.
 
 Investigate and gather concrete evidence for:
 - Whether they are an active real-estate agent (and how confident you are).
-- The agency/brokerage they CURRENTLY work for and their current agent profile page — not a \
-past employer. Agents change agencies, and search results can show stale, cached content from a \
-page that no longer reflects reality. If you find more than one agency associated with the \
-person, don't just report the first or most-prominent one — use the fetch tool to actually load \
-the agency's own official profile/team page directly rather than trusting a search snippet about \
-it. If a claimed "current" profile page errors out or looks removed when fetched, treat that as \
-real evidence the person has left that agency, not as a dead end to ignore. Prefer whichever \
-evidence carries the most recent dates (recent listings, recent award mentions, a live team page) \
-over older material that may be stale or cached.
+- The agency/brokerage associated with them on these sites. This may be out of date — a separate \
+pass will specifically verify their CURRENT employer — so just report what these sites show \
+without exhaustively chasing verification here.
 - Their active listings right now (find 2-3 of the most recent, with address + price + link).
 - A recently sold listing (ideally within the last ~90 days).
 - Whether they work in a team and roughly how many people are with them.
 - Roughly how many years they have been an agent.
-- Their active social/professional profiles (LinkedIn, Instagram, Facebook business page, etc.).
+- Their active social/professional profiles, if shown on these sites.
 
 Search by name plus likely qualifiers (real estate, the agency, the region). The email may be \
 a personal address, so don't rely on the email domain to find them. Be honest about uncertainty: \
-if you cannot find evidence the person is an agent, say so clearly rather than guessing. Cite the \
-sources you used. End with a clear written dossier covering every point above.
+if you cannot find evidence the person is an agent on these sites, say so clearly rather than \
+guessing — they may still be a genuine agent who simply isn't well represented here, that's fine, \
+don't stretch to compensate. Cite the sources you used. End with a clear written dossier covering \
+every point above.
 
-Once you have solid evidence for each point above, stop searching — you do not need to \
-exhaustively check every listing site, social network, or directory a well-established agent \
-might appear on. A handful of good sources is enough; prioritize finishing over completeness."""
+Once you have solid evidence for each point, stop searching — a handful of good sources is enough."""
+
+RESEARCH_SYSTEM_PASS2 = """You are continuing a real-estate lead qualification, focused \
+specifically on verifying the person's CURRENT employer. An earlier pass (restricted to major \
+aggregator sites) already produced a first dossier, included in the user message below — treat \
+its agency claim as a starting hypothesis, not a confirmed fact.
+
+Agents change agencies, and search results — even a directly fetched page — can show stale, \
+cached content that no longer reflects reality. Your job:
+- Use web search plus the fetch tool to confirm who they currently work for. Actually fetch the \
+agency's own official profile/team page directly rather than trusting a search snippet about it — \
+a claimed "current" profile page that errors out or looks removed when fetched is itself real \
+evidence the person has left that agency.
+- If you find a different, more recent agency than the one in the first pass, that supersedes it \
+— report the more recent one as current, and note the discrepancy explicitly.
+- Once the agency question is settled, if you have fetch budget left, spend it fetching the \
+person's Trade Me Property agent profile directly (trademe.co.nz/a/property/agent/<Name>) for an \
+accurate current listing count — Trade Me's own profile pages have proven reliable and complete \
+for this specifically, noticeably more so than a search-snippet estimate, which tends to \
+undercount. Note: RateMyAgent blocks direct fetching (returns a 403) — don't spend a fetch call \
+on it, only use it via search if it comes up. If there's still budget after that, also try to \
+fill in anything else the first pass flagged as not found or unconfirmed (recent sales, team, \
+social profiles) — but the agency question is always the priority; don't spend budget on anything \
+else at the expense of settling that one.
+
+End with a written summary that clearly states the confirmed current agency and cites the source \
+that confirms it — or clearly states you could not confirm one, if that's the honest answer."""
 
 STRUCTURE_SYSTEM = """Extract the research dossier into a single JSON object. Only record facts \
 supported by the dossier; set is_real_estate_agent accordingly. Do not invent listings, teams, or tenure.
@@ -219,41 +275,25 @@ Return ONLY the JSON object (no prose, no markdown fences), with exactly this sh
 }"""
 
 
-def research(client: anthropic.Anthropic, lead: Lead) -> str:
-    """Run the web-research pass, returning a plain-text dossier."""
-    user = (
+def _lead_intro(lead: Lead) -> str:
+    return (
         f"Lead from a Facebook lead form:\n"
         f"- Name: {lead.name}\n"
         f"- Email: {lead.email} ({'personal' if lead.email_is_personal else 'work/domain'} address)\n"
         f"- Phone: {lead.phone or 'n/a'}\n"
         f"- Location hint: {lead.location or 'n/a'}\n\n"
-        f"Research this person and produce the dossier."
     )
+
+
+def _run_research(client: anthropic.Anthropic, system_prompt: str, tools: list, user: str, label: str) -> str:
+    """Shared agentic-turn runner behind both research passes: streaming,
+    deadline-enforced, bounded pause_turn loop, real-time + post-round
+    diagnostics. `label` just prefixes log lines ("pass1"/"pass2")."""
     messages = [{"role": "user", "content": user}]
-    tools = [
-        {"type": "web_search_20260209", "name": "web_search", "max_uses": 15},
-        # No per-use fee (token cost only, ~2,500 tokens for a typical page) — capped low since
-        # this is meant for targeted verification of a claimed "current agency" page, not broad
-        # fetching. max_content_tokens guards against an unexpectedly large page.
-        #
-        # use_cache=False matters a lot for what this tool is actually for here: by default
-        # web_fetch may serve Anthropic's own cached copy of a page rather than the live one
-        # ("may not always reflect the latest version available at the URL" per Anthropic's
-        # docs) — observed directly: fetching an agent's ex-employer's profile page returned
-        # 200 OK with full content, when the live page 404s. That's exactly backwards for
-        # "verify this person still works here." use_cache requires web_fetch_20260309+.
-        {
-            "type": "web_fetch_20260309",
-            "name": "web_fetch",
-            "max_uses": 3,
-            "max_content_tokens": 8000,
-            "use_cache": False,
-        },
-    ]
 
     for round_num in range(1, 7):  # bound the server-side tool loop (pause_turn)
         round_start = time.monotonic()
-        print(f"     [research round {round_num}] calling {MODEL} (streaming) ...", file=sys.stderr)
+        print(f"     [{label} round {round_num}] calling {MODEL} (streaming) ...", file=sys.stderr)
         # Streaming, not a single blocking create() call: a long non-streaming
         # request can hit infra-level timeouts (proxies between us and the
         # model) independent of any client-side timeout we configure, once
@@ -269,26 +309,41 @@ def research(client: anthropic.Anthropic, lead: Lead) -> str:
         # deliberately abort past that point rather than trusting either the
         # infrastructure or an open-ended stream to bound it for us.
         deadline = round_start + REQUEST_TIMEOUT_SECONDS
+        tool_call_count = 0
         with client.messages.stream(
             model=MODEL,
             max_tokens=8000,
-            system=RESEARCH_SYSTEM,
+            system=system_prompt,
             thinking={"type": "adaptive"},
             output_config={"effort": "medium"},
             tools=tools,
             messages=messages,
         ) as stream:
-            for _event in stream:
+            for event in stream:
                 if time.monotonic() > deadline:
                     raise TimeoutError(
-                        f"research round {round_num} exceeded {REQUEST_TIMEOUT_SECONDS:.0f}s while "
+                        f"{label} round {round_num} exceeded {REQUEST_TIMEOUT_SECONDS:.0f}s while "
                         f"streaming — aborting deliberately rather than waiting indefinitely"
+                    )
+                # Real-time progress, not just post-round: a tool call
+                # starting is the clearest sign of forward progress, and the
+                # thing we most need visibility into if a round times out —
+                # added after two leads timed out with zero diagnostic
+                # output, since the post-round print below only ever fires
+                # on a round that actually completes.
+                block = getattr(event, "content_block", None)
+                if getattr(event, "type", "") == "content_block_start" and getattr(block, "type", "") == "server_tool_use":
+                    tool_call_count += 1
+                    print(
+                        f"     [{label} round {round_num}] tool call #{tool_call_count}: "
+                        f"{getattr(block, 'name', '?')} ({time.monotonic() - round_start:.0f}s in) ...",
+                        file=sys.stderr,
                     )
             resp = stream.get_final_message()
         elapsed = time.monotonic() - round_start
         n_searches = sum(1 for b in resp.content if getattr(b, "type", "") == "server_tool_use")
         print(
-            f"     [research round {round_num}] {elapsed:.1f}s  "
+            f"     [{label} round {round_num}] {elapsed:.1f}s  "
             f"stop_reason={resp.stop_reason}  searches_this_round={n_searches}  usage={resp.usage}",
             file=sys.stderr,
         )
@@ -303,13 +358,13 @@ def research(client: anthropic.Anthropic, lead: Lead) -> str:
             content = getattr(b, "content", None)
             url = getattr(content, "url", "?")
             if getattr(content, "type", "") == "web_fetch_tool_result_error":
-                print(f"     [research round {round_num}] web_fetch ERROR  url={url}  error_code={getattr(content, 'error_code', '?')}", file=sys.stderr)
+                print(f"     [{label} round {round_num}] web_fetch ERROR  url={url}  error_code={getattr(content, 'error_code', '?')}", file=sys.stderr)
                 continue
             doc = getattr(content, "content", None)
             source = getattr(doc, "source", None)
             data = getattr(source, "data", "") if source else ""
             size = len(data) if isinstance(data, str) else "n/a (binary)"
-            print(f"     [research round {round_num}] web_fetch OK  url={url}  content_chars={size}", file=sys.stderr)
+            print(f"     [{label} round {round_num}] web_fetch OK  url={url}  content_chars={size}", file=sys.stderr)
         if resp.stop_reason == "pause_turn":
             messages = [
                 {"role": "user", "content": user},
@@ -319,6 +374,159 @@ def research(client: anthropic.Anthropic, lead: Lead) -> str:
         break
 
     return "\n".join(b.text for b in resp.content if b.type == "text").strip()
+
+
+def research_pass1(client: anthropic.Anthropic, lead: Lead) -> str:
+    """Cheap, fast pass: search restricted to known NZ real-estate
+    aggregator sites only, no fetch. Enough to get a verdict and a rough
+    picture for most leads on its own."""
+    tools = [
+        {
+            "type": "web_search_20260209",
+            "name": "web_search",
+            "max_uses": 6,
+            "allowed_domains": KNOWN_AGENT_SITES,
+            "user_location": NZ_LOCATION,
+            # _20260209+ defaults to routing calls through code execution
+            # ("dynamic filtering") to trim results before they hit context —
+            # and that code-execution loop isn't bounded by max_uses at all
+            # (only web_search_requests/web_fetch_requests count against it).
+            # Observed directly: a lead's pass 1 got stuck making repeated
+            # code_execution/bash_code_execution calls with growing gaps
+            # between them (39s -> 71s -> 138s -> 266s) until the 300s
+            # deadline killed it — inside the "cheap" 6-search pass. Forcing
+            # direct invocation removes that failure mode entirely rather
+            # than trying to bound a mechanism we don't control the shape of.
+            "allowed_callers": ["direct"],
+        },
+    ]
+    user = _lead_intro(lead) + "Research this person and produce the dossier."
+    return _run_research(client, RESEARCH_SYSTEM_PASS1, tools, user, label="pass1")
+
+
+def research_pass2(client: anthropic.Anthropic, lead: Lead, pass1_dossier: str) -> str:
+    """Targeted, more expensive pass — only run for leads pass 1 already
+    found agent evidence for. Open search + fetch (cache bypassed), aimed
+    specifically at confirming the CURRENT employer, since that's the one
+    question the known aggregator sites answer worst (a very recent agency
+    change may not be reflected on any of them yet)."""
+    tools = [
+        {
+            "type": "web_search_20260209",
+            "name": "web_search",
+            "max_uses": 8,
+            "user_location": NZ_LOCATION,
+            "allowed_callers": ["direct"],  # see research_pass1 for why
+        },
+        # No per-use fee (token cost only, ~2,500 tokens for a typical page) — capped low since
+        # this is meant for targeted verification of a claimed "current agency" page, not broad
+        # fetching. max_content_tokens guards against an unexpectedly large page.
+        #
+        # use_cache=False matters a lot for what this tool is actually for here: by default
+        # web_fetch may serve Anthropic's own cached copy of a page rather than the live one
+        # ("may not always reflect the latest version available at the URL" per Anthropic's
+        # docs) — observed directly: fetching an agent's ex-employer's profile page returned
+        # 200 OK with full content, when the live page 404s. That's exactly backwards for
+        # "verify this person still works here." use_cache requires web_fetch_20260309+.
+        #
+        # allowed_callers: web_fetch_20260209+ defaults to code-execution-mediated
+        # calls too, same as web_search — see research_pass1 for the failure this caused.
+        {
+            "type": "web_fetch_20260309",
+            "name": "web_fetch",
+            "max_uses": 3,
+            "max_content_tokens": 8000,
+            "use_cache": False,
+            "allowed_callers": ["direct"],
+        },
+    ]
+    user = (
+        _lead_intro(lead)
+        + "Here is what an initial pass (restricted to major NZ real-estate aggregator sites) "
+          "already found:\n\n---\n" + pass1_dossier + "\n---\n\n"
+        + "Your job now: verify this person's CURRENT employer specifically — see your "
+          "instructions above."
+    )
+    return _run_research(client, RESEARCH_SYSTEM_PASS2, tools, user, label="pass2")
+
+
+# The only fields in this schema where null is intentional/expected — see
+# Evidence's field descriptions. Everything else is a plain string (or a
+# list), and the model will sometimes return null for one of those it has
+# no value for (e.g. a listing's price when unstated, or a whole list when
+# it found nothing) — natural given how strongly the rest of this schema
+# says "use null when unconfirmed," but it crashes Pydantic validation for
+# fields that were never meant to be nullable, no matter how deeply nested
+# (recent_listings[i].price, social_profiles[i].url, etc.). Rather than
+# patch one field at a time as each new one surfaces after an
+# already-costly research call, sanitize generically before validation:
+_NULLABLE_EVIDENCE_FIELDS = {"active_listings_count", "sold_last_90_days_count", "has_team", "team_size", "years_experience"}
+_LIST_EVIDENCE_FIELDS = {"recent_listings", "recent_sold", "social_profiles"}
+_NUMERIC_EVIDENCE_FIELDS = {"active_listings_count", "sold_last_90_days_count", "team_size", "years_experience"}
+
+
+def _sanitize_nulls(obj):
+    """Recursively: null on an intentionally-nullable field stays null; null
+    on a list field becomes []; null on anything else becomes ""."""
+    if isinstance(obj, dict):
+        result = {}
+        for k, v in obj.items():
+            if v is None:
+                if k in _NULLABLE_EVIDENCE_FIELDS:
+                    result[k] = None
+                elif k in _LIST_EVIDENCE_FIELDS:
+                    result[k] = []
+                else:
+                    result[k] = ""
+            else:
+                result[k] = _sanitize_nulls(v)
+        return result
+    if isinstance(obj, list):
+        return [_sanitize_nulls(x) for x in obj]
+    return obj
+
+
+def _coerce_numeric_strings(data: dict) -> dict:
+    """A numeric field can come back as a non-numeric string (e.g. "several",
+    "5+") — conversational rather than malformed, but Pydantic won't coerce
+    it. Pull out a leading number if there is one; otherwise treat it the
+    same as "not confirmed" (None) rather than crash on it."""
+    for key in _NUMERIC_EVIDENCE_FIELDS:
+        value = data.get(key)
+        if isinstance(value, str):
+            match = re.search(r"[\d.]+", value)
+            data[key] = float(match.group()) if match else None
+    return data
+
+
+def _normalize_verdict_fields(data: dict) -> dict:
+    """The two fields score()'s P6 safety check depends on — is_real_estate_agent
+    and confidence — get normalized defensively, in different directions on
+    purpose: the dossier's own verdict language is three-way (YES/NO/UNCLEAR),
+    but the schema is strictly bool, so anything not a clean true/false
+    collapses to False (treating "unclear" as "not confirmed" is the safe
+    direction of error — the dangerous one would be defaulting an uncertain
+    case to True). confidence has no enum constraint at the type level, so
+    anything other than exactly "high"/"medium"/"low" collapses to "low".
+    This isn't just crash-prevention: without it, an unrecognized confidence
+    value like "very uncertain" silently fails score()'s `confidence == "low"`
+    check and slips through to a normal (wrong) score instead of P6 — no
+    crash, no error, nothing to notice. That's worse than a crash."""
+    agent = data.get("is_real_estate_agent")
+    if isinstance(agent, str):
+        data["is_real_estate_agent"] = agent.strip().lower() in ("true", "yes", "y", "1")
+    elif not isinstance(agent, bool):
+        data["is_real_estate_agent"] = False
+
+    confidence = data.get("confidence")
+    normalized = str(confidence).strip().lower() if confidence is not None else ""
+    data["confidence"] = normalized if normalized in ("high", "medium", "low") else "low"
+
+    notes = data.get("notes")
+    if isinstance(notes, list):
+        data["notes"] = "; ".join(str(n) for n in notes)
+
+    return data
 
 
 def structure(client: anthropic.Anthropic, dossier: str) -> Evidence:
@@ -346,7 +554,17 @@ def structure(client: anthropic.Anthropic, dossier: str) -> Evidence:
     start, end = text.find("{"), text.rfind("}")
     if start != -1 and end != -1:
         text = text[start:end + 1]
-    return Evidence.model_validate(json.loads(text))
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as e:
+        # A clean crash either way, but log what we actually got before it's
+        # lost — this is the one failure mode that isn't a known field-level
+        # shape mismatch, so there's nothing to sanitize; better to fail with
+        # the raw text on hand than a bare "line 1 column 1" JSONDecodeError.
+        print(f"     [structure] failed to parse JSON, raw text was: {text[:500]!r}", file=sys.stderr)
+        raise
+    data = _coerce_numeric_strings(_normalize_verdict_fields(data))
+    return Evidence.model_validate(_sanitize_nulls(data))
 
 
 # --------------------------------------------------------------------------- #
@@ -541,11 +759,30 @@ class EnrichmentResult:
 
 def enrich_one(client: anthropic.Anthropic, lead: Lead) -> EnrichmentResult:
     """Research + structure + score one lead. Pure compute, no I/O — callers
-    decide whether/where to persist the result (local file, AC, etc.)."""
-    print(f"  -> researching {lead.name} ...", file=sys.stderr)
-    dossier = research(client, lead)
-    print(f"  -> structuring evidence ...", file=sys.stderr)
-    ev = structure(client, dossier)
+    decide whether/where to persist the result (local file, AC, etc.).
+
+    Two-pass research: a cheap pass restricted to known NZ real-estate
+    aggregator sites first, then a structure() call to check whether it's
+    even worth continuing. Only leads with actual agent evidence get a
+    second, more expensive pass (open search + fetch) — narrowly targeted at
+    the one question aggregator sites answer worst: who's their CURRENT
+    employer. Non-agents (and low-confidence cases) stay on the cheap path
+    entirely. See RESEARCH_SYSTEM_PASS1/PASS2 and the build plan for why.
+    """
+    print(f"  -> researching {lead.name} (pass 1: known NZ sites) ...", file=sys.stderr)
+    pass1_dossier = research_pass1(client, lead)
+
+    print(f"  -> structuring pass-1 evidence ...", file=sys.stderr)
+    ev = structure(client, pass1_dossier)
+    dossier = pass1_dossier
+
+    if ev.is_real_estate_agent and ev.confidence != "low":
+        print(f"  -> researching {lead.name} (pass 2: verify current agency) ...", file=sys.stderr)
+        pass2_dossier = research_pass2(client, lead, pass1_dossier)
+        dossier = pass1_dossier + "\n\n=== PASS 2 (current-agency verification) ===\n\n" + pass2_dossier
+        print(f"  -> structuring combined evidence ...", file=sys.stderr)
+        ev = structure(client, dossier)
+
     sc = score(ev, lead)
     report = render(lead, ev, sc, dossier)
     return EnrichmentResult(lead, ev, sc, dossier, report)
