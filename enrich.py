@@ -22,13 +22,15 @@ import csv
 import json
 import os
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
 from typing import List, Optional
 
 import anthropic
-from pydantic import BaseModel, Field
+import httpx
+from pydantic import BaseModel, Field, model_validator
 
 try:  # load ANTHROPIC_API_KEY from a local .env if present
     from dotenv import load_dotenv
@@ -36,8 +38,35 @@ try:  # load ANTHROPIC_API_KEY from a local .env if present
 except ImportError:
     pass
 
-MODEL = "claude-opus-4-8"
+MODEL = "claude-opus-4-8"  # research() — the judgment-heavy call, kept on Opus
+STRUCTURE_MODEL = "claude-haiku-4-5-20251001"  # structure() — mechanical extraction from an already-written dossier, doesn't need Opus
 REPORTS_DIR = Path("reports")
+
+# A hung request (rare, but seen in practice — one research call ran 20+
+# minutes with no error) shouldn't be able to block a batch or a scheduled
+# pipeline run indefinitely. This bounds every individual request made by
+# the client — not the whole research() loop, which can itself make up to 6
+# such requests on pause_turn, so the real worst-case ceiling is several
+# times this number. On timeout, anthropic raises APITimeoutError, which the
+# per-lead try/except in main()/pipeline.py catches so the batch keeps going.
+#
+# A single float here isn't a reliable hard ceiling — it maps to equal
+# connect/read/write/pool timeouts, and a read timeout only fires on gaps
+# between bytes, so it can be reset indefinitely by keep-alive-style trickle
+# data from the server during a genuinely very long generation (observed:
+# a request ran 14+ minutes past a nominal 300s timeout with no error).
+# Explicit bounds close that gap. max_retries=0 matters too: the SDK retries
+# retryable failures (including timeouts) a few times by default, each
+# retry getting its own fresh timeout window — silently multiplying both
+# wait time and cost. We already have our own retry mechanism (a failed
+# lead just stays tagged for the next scheduled poll), so we don't want the
+# SDK retrying inside a single run on top of that.
+REQUEST_TIMEOUT_SECONDS = 300.0
+
+
+def make_client() -> anthropic.Anthropic:
+    timeout = httpx.Timeout(connect=10.0, read=REQUEST_TIMEOUT_SECONDS, write=30.0, pool=10.0)
+    return anthropic.Anthropic(timeout=timeout, max_retries=0)
 
 
 # --------------------------------------------------------------------------- #
@@ -84,17 +113,44 @@ class Evidence(BaseModel):
     agency_name: str = Field(default="", description="Brokerage/agency they work for")
     agency_website: str = Field(default="")
     profile_url: str = Field(default="", description="Their agent profile page")
-    years_experience: Optional[int] = Field(
-        default=None, description="Years working as an agent, if determinable"
+    years_experience: Optional[float] = Field(
+        default=None, description="Years working as an agent, if determinable (fractional OK, e.g. 5.5)"
     )
-    active_listings_count: int = Field(default=0)
+    active_listings_count: Optional[int] = Field(
+        default=None, description="null if not confirmed (e.g. search ran out before checking) — 0 only if confirmed to be zero"
+    )
     recent_listings: List[Listing] = Field(default_factory=list)
-    sold_last_90_days_count: int = Field(default=0)
+    sold_last_90_days_count: Optional[int] = Field(
+        default=None, description="null if not confirmed (e.g. search ran out before checking) — 0 only if confirmed to be zero"
+    )
     recent_sold: List[Listing] = Field(default_factory=list)
-    has_team: bool = Field(default=False)
-    team_size: int = Field(default=0, description="People clearly working with them (0 if unknown/solo)")
+    has_team: Optional[bool] = Field(
+        default=None, description="null if not confirmed either way — true/false only if actually determined"
+    )
+    team_size: Optional[int] = Field(
+        default=None, description="null if not confirmed — 0 only if confirmed to be solo, no team"
+    )
     social_profiles: List[SocialProfile] = Field(default_factory=list)
     notes: str = Field(default="", description="Anything else relevant to lead quality")
+
+    # Defensive hardening, added after three separate live runs each spent
+    # real research cost only to crash on structure()'s output not matching
+    # the schema exactly (e.g. the model returning 5.75 for years_experience,
+    # or null for a field we'd typed as a bare int). Rather than keep
+    # patching one field at a time as each new mismatch surfaces — expensive,
+    # since the crash happens after the costly research call already ran —
+    # round any stray float down to int for the fields that should always be
+    # whole numbers, before Pydantic's normally-strict validation runs.
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_whole_number_fields(cls, data):
+        if not isinstance(data, dict):
+            return data
+        for key in ("active_listings_count", "sold_last_90_days_count", "team_size"):
+            value = data.get(key)
+            if isinstance(value, float):
+                data[key] = round(value)
+        return data
 
 
 # --------------------------------------------------------------------------- #
@@ -107,7 +163,15 @@ whether they are genuinely a practising real-estate agent.
 
 Investigate and gather concrete evidence for:
 - Whether they are an active real-estate agent (and how confident you are).
-- The agency/brokerage they work for and their agent profile page.
+- The agency/brokerage they CURRENTLY work for and their current agent profile page — not a \
+past employer. Agents change agencies, and search results can show stale, cached content from a \
+page that no longer reflects reality. If you find more than one agency associated with the \
+person, don't just report the first or most-prominent one — use the fetch tool to actually load \
+the agency's own official profile/team page directly rather than trusting a search snippet about \
+it. If a claimed "current" profile page errors out or looks removed when fetched, treat that as \
+real evidence the person has left that agency, not as a dead end to ignore. Prefer whichever \
+evidence carries the most recent dates (recent listings, recent award mentions, a live team page) \
+over older material that may be stale or cached.
 - Their active listings right now (find 2-3 of the most recent, with address + price + link).
 - A recently sold listing (ideally within the last ~90 days).
 - Whether they work in a team and roughly how many people are with them.
@@ -117,11 +181,24 @@ Investigate and gather concrete evidence for:
 Search by name plus likely qualifiers (real estate, the agency, the region). The email may be \
 a personal address, so don't rely on the email domain to find them. Be honest about uncertainty: \
 if you cannot find evidence the person is an agent, say so clearly rather than guessing. Cite the \
-sources you used. End with a clear written dossier covering every point above."""
+sources you used. End with a clear written dossier covering every point above.
+
+Once you have solid evidence for each point above, stop searching — you do not need to \
+exhaustively check every listing site, social network, or directory a well-established agent \
+might appear on. A handful of good sources is enough; prioritize finishing over completeness."""
 
 STRUCTURE_SYSTEM = """Extract the research dossier into a single JSON object. Only record facts \
-supported by the dossier; if something was not found, use empty string / 0 / null / empty list and \
-set is_real_estate_agent accordingly. Do not invent listings, teams, or tenure.
+supported by the dossier; set is_real_estate_agent accordingly. Do not invent listings, teams, or tenure.
+
+For active_listings_count, sold_last_90_days_count, has_team, and team_size specifically: the dossier will \
+often distinguish between "confirmed none" and "not confirmed / ran out of search budget before \
+checking" (e.g. it may say something was blocked by a search-tool limit, or that it simply wasn't \
+investigated). This distinction matters a lot downstream, so preserve it exactly:
+  - Use `null` when the dossier did not actually confirm the answer either way — including "the \
+    search tool hit its usage cap before this could be checked." Do NOT default to 0/false just \
+    because a number wasn't stated.
+  - Use a real 0 / false ONLY when the dossier explicitly states the count is zero / no team was \
+    found, as an actual confirmed finding, not merely the absence of a number in the text.
 
 Return ONLY the JSON object (no prose, no markdown fences), with exactly this shape:
 {
@@ -131,12 +208,12 @@ Return ONLY the JSON object (no prose, no markdown fences), with exactly this sh
   "agency_website": "",
   "profile_url": "",
   "years_experience": null,
-  "active_listings_count": 0,
+  "active_listings_count": null,
   "recent_listings": [{"address": "", "price": "", "url": ""}],
-  "sold_last_90_days_count": 0,
+  "sold_last_90_days_count": null,
   "recent_sold": [{"address": "", "price": "", "url": ""}],
-  "has_team": false,
-  "team_size": 0,
+  "has_team": null,
+  "team_size": null,
   "social_profiles": [{"platform": "", "url": ""}],
   "notes": ""
 }"""
@@ -153,18 +230,86 @@ def research(client: anthropic.Anthropic, lead: Lead) -> str:
         f"Research this person and produce the dossier."
     )
     messages = [{"role": "user", "content": user}]
-    tools = [{"type": "web_search_20260209", "name": "web_search", "max_uses": 8}]
+    tools = [
+        {"type": "web_search_20260209", "name": "web_search", "max_uses": 15},
+        # No per-use fee (token cost only, ~2,500 tokens for a typical page) — capped low since
+        # this is meant for targeted verification of a claimed "current agency" page, not broad
+        # fetching. max_content_tokens guards against an unexpectedly large page.
+        #
+        # use_cache=False matters a lot for what this tool is actually for here: by default
+        # web_fetch may serve Anthropic's own cached copy of a page rather than the live one
+        # ("may not always reflect the latest version available at the URL" per Anthropic's
+        # docs) — observed directly: fetching an agent's ex-employer's profile page returned
+        # 200 OK with full content, when the live page 404s. That's exactly backwards for
+        # "verify this person still works here." use_cache requires web_fetch_20260309+.
+        {
+            "type": "web_fetch_20260309",
+            "name": "web_fetch",
+            "max_uses": 3,
+            "max_content_tokens": 8000,
+            "use_cache": False,
+        },
+    ]
 
-    for _ in range(6):  # bound the server-side tool loop (pause_turn)
-        resp = client.messages.create(
+    for round_num in range(1, 7):  # bound the server-side tool loop (pause_turn)
+        round_start = time.monotonic()
+        print(f"     [research round {round_num}] calling {MODEL} (streaming) ...", file=sys.stderr)
+        # Streaming, not a single blocking create() call: a long non-streaming
+        # request can hit infra-level timeouts (proxies between us and the
+        # model) independent of any client-side timeout we configure, once
+        # the server goes quiet for too long mid-generation. A continuous
+        # stream of events keeps the connection visibly alive throughout, so
+        # nothing in between kills it prematurely. See
+        # https://docs.anthropic.com/en/api/errors#long-requests.
+        #
+        # Streaming alone would remove our own ceiling too, though — nothing
+        # about it stops a genuinely slow-but-progressing generation from
+        # running indefinitely. So we still enforce REQUEST_TIMEOUT_SECONDS
+        # ourselves, checked against wall-clock time on every event, and
+        # deliberately abort past that point rather than trusting either the
+        # infrastructure or an open-ended stream to bound it for us.
+        deadline = round_start + REQUEST_TIMEOUT_SECONDS
+        with client.messages.stream(
             model=MODEL,
             max_tokens=8000,
             system=RESEARCH_SYSTEM,
             thinking={"type": "adaptive"},
-            output_config={"effort": "high"},
+            output_config={"effort": "medium"},
             tools=tools,
             messages=messages,
+        ) as stream:
+            for _event in stream:
+                if time.monotonic() > deadline:
+                    raise TimeoutError(
+                        f"research round {round_num} exceeded {REQUEST_TIMEOUT_SECONDS:.0f}s while "
+                        f"streaming — aborting deliberately rather than waiting indefinitely"
+                    )
+            resp = stream.get_final_message()
+        elapsed = time.monotonic() - round_start
+        n_searches = sum(1 for b in resp.content if getattr(b, "type", "") == "server_tool_use")
+        print(
+            f"     [research round {round_num}] {elapsed:.1f}s  "
+            f"stop_reason={resp.stop_reason}  searches_this_round={n_searches}  usage={resp.usage}",
+            file=sys.stderr,
         )
+        # Which URLs web_fetch actually pulled, and how large each one was —
+        # added after a single round unexpectedly added ~635k input tokens
+        # with only 3 fetches, well beyond the ~2,500 tokens/page estimate
+        # for a typical page. This tells us exactly which URL was the culprit
+        # next time, instead of guessing.
+        for b in resp.content:
+            if getattr(b, "type", "") != "web_fetch_tool_result":
+                continue
+            content = getattr(b, "content", None)
+            url = getattr(content, "url", "?")
+            if getattr(content, "type", "") == "web_fetch_tool_result_error":
+                print(f"     [research round {round_num}] web_fetch ERROR  url={url}  error_code={getattr(content, 'error_code', '?')}", file=sys.stderr)
+                continue
+            doc = getattr(content, "content", None)
+            source = getattr(doc, "source", None)
+            data = getattr(source, "data", "") if source else ""
+            size = len(data) if isinstance(data, str) else "n/a (binary)"
+            print(f"     [research round {round_num}] web_fetch OK  url={url}  content_chars={size}", file=sys.stderr)
         if resp.stop_reason == "pause_turn":
             messages = [
                 {"role": "user", "content": user},
@@ -182,9 +327,14 @@ def structure(client: anthropic.Anthropic, dossier: str) -> Evidence:
     We ask for plain JSON and validate with Pydantic rather than using strict
     structured outputs — the constrained-decoding grammar for this nested schema
     can time out to compile, and a normal JSON pass is plenty reliable here.
+
+    Runs on STRUCTURE_MODEL (Haiku), not the research model — this is
+    mechanical extraction from a dossier Opus already wrote, not a judgment
+    call, so it doesn't need Opus-level reasoning. Meaningfully cheaper for
+    no real quality cost.
     """
     resp = client.messages.create(
-        model=MODEL,
+        model=STRUCTURE_MODEL,
         max_tokens=4000,
         system=STRUCTURE_SYSTEM,
         messages=[{"role": "user", "content": dossier}],
@@ -208,11 +358,13 @@ class Score:
     priority: str
     priority_label: str
     breakdown: List[str] = field(default_factory=list)
+    incomplete: bool = False  # True if scored with one or more categories unconfirmed — see score()
 
 
 def score(ev: Evidence, lead: Lead) -> Score:
     pts = 0
     bd: List[str] = []
+    unconfirmed: List[str] = []
 
     def add(n: int, reason: str):
         nonlocal pts
@@ -226,32 +378,48 @@ def score(ev: Evidence, lead: Lead) -> Score:
 
     add(20, f"Confirmed real-estate agent (confidence: {ev.confidence})")
 
-    if ev.active_listings_count >= 3:
+    # active_listings_count / sold_last_90_days_count / has_team are all
+    # Optional: None means the research didn't actually confirm the answer
+    # (e.g. ran out of search budget), a real 0/false means it did and found
+    # none. Unconfirmed categories are skipped rather than scored as zero —
+    # a lead shouldn't be penalized for a gap in the research — and flagged
+    # via `incomplete` so the score is never silently treated as final.
+    if ev.active_listings_count is None:
+        bd.append("   ??  Active listings not confirmed (research incomplete)")
+        unconfirmed.append("active listings")
+    elif ev.active_listings_count >= 3:
         add(20, f"{ev.active_listings_count} active listings")
     elif ev.active_listings_count >= 1:
         add(10, f"{ev.active_listings_count} active listing(s)")
     else:
-        bd.append("    0  No active listings found")
+        bd.append("    0  No active listings found (confirmed)")
 
-    if ev.sold_last_90_days_count >= 2:
+    if ev.sold_last_90_days_count is None:
+        bd.append("   ??  Recent solds not confirmed (research incomplete)")
+        unconfirmed.append("recent solds")
+    elif ev.sold_last_90_days_count >= 2:
         add(20, f"{ev.sold_last_90_days_count} sold in ~last 90 days")
     elif ev.sold_last_90_days_count >= 1:
         add(10, f"{ev.sold_last_90_days_count} recent sold")
     else:
-        bd.append("    0  No recent solds found")
+        bd.append("    0  No recent solds found (confirmed)")
 
-    if ev.team_size >= 1 or ev.has_team:
+    if ev.has_team is None and not ev.team_size:
+        bd.append("   ??  Team status not confirmed (research incomplete)")
+        unconfirmed.append("team status")
+    elif (ev.team_size or 0) >= 1 or ev.has_team:
         add(15, f"Works in a team (~{ev.team_size or 'size unknown'})")
 
     if ev.years_experience is not None:
+        yexp_display = round(ev.years_experience, 1)
         if ev.years_experience >= 7:
-            add(15, f"{ev.years_experience} yrs experience")
+            add(15, f"{yexp_display} yrs experience")
         elif ev.years_experience >= 5:
-            add(12, f"{ev.years_experience} yrs experience")
+            add(12, f"{yexp_display} yrs experience")
         elif ev.years_experience >= 3:
-            add(8, f"{ev.years_experience} yrs experience")
+            add(8, f"{yexp_display} yrs experience")
         else:
-            add(3, f"{ev.years_experience} yrs experience (early career)")
+            add(3, f"{yexp_display} yrs experience (early career)")
 
     n_social = len(ev.social_profiles)
     if n_social >= 2:
@@ -271,7 +439,12 @@ def score(ev: Evidence, lead: Lead) -> Score:
         prio, label = "P4", "Moderate"
     else:
         prio, label = "P5", "Low — light evidence"
-    return Score(pts, prio, label, bd)
+
+    incomplete = len(unconfirmed) > 0
+    if incomplete:
+        bd.append(f"   !!  Score may be understated — {', '.join(unconfirmed)} could not be confirmed")
+
+    return Score(pts, prio, label, bd, incomplete=incomplete)
 
 
 # --------------------------------------------------------------------------- #
@@ -294,6 +467,10 @@ def render(lead: Lead, ev: Evidence, sc: Score, dossier: str) -> str:
     w("-" * 70)
     w(f"  SCORE:     {sc.points}/100")
     w(f"  PRIORITY:  {sc.priority}  —  {sc.priority_label}")
+    if sc.incomplete:
+        w("  ⚠  INCOMPLETE — one or more categories could not be confirmed (see")
+        w("     SCORE BREAKDOWN below). This score may be understated; consider a")
+        w("     manual follow-up rather than treating it as final.")
     w("-" * 70)
     w("")
     w("VERDICT")
@@ -308,17 +485,20 @@ def render(lead: Lead, ev: Evidence, sc: Score, dossier: str) -> str:
         w(f"  Agency site:     {ev.agency_website}")
     if ev.profile_url:
         w(f"  Agent profile:   {ev.profile_url}")
-    yexp = ev.years_experience if ev.years_experience is not None else "unknown"
+    yexp = round(ev.years_experience) if ev.years_experience is not None else "unknown"
     w(f"  Experience:      {yexp} years")
-    w(f"  Team:            {'Yes' if (ev.has_team or ev.team_size) else 'No / solo'}"
-      + (f" (~{ev.team_size} people)" if ev.team_size else ""))
+    if ev.has_team is None and not ev.team_size:
+        w("  Team:            not confirmed")
+    else:
+        w(f"  Team:            {'Yes' if (ev.has_team or ev.team_size) else 'No / solo'}"
+          + (f" (~{ev.team_size} people)" if ev.team_size else ""))
     w("")
-    w(f"  Active listings: {ev.active_listings_count}")
+    w(f"  Active listings: {ev.active_listings_count if ev.active_listings_count is not None else 'not confirmed'}")
     for x in ev.recent_listings:
         w(f"     - {x.address}{(' — ' + x.price) if x.price else ''}")
         if x.url:
             w(f"       {x.url}")
-    w(f"  Sold (~90 days): {ev.sold_last_90_days_count}")
+    w(f"  Sold (~90 days): {ev.sold_last_90_days_count if ev.sold_last_90_days_count is not None else 'not confirmed'}")
     for x in ev.recent_sold:
         w(f"     - {x.address}{(' — ' + x.price) if x.price else ''}")
         if x.url:
@@ -414,7 +594,7 @@ def main():
     else:
         ap.error("Provide --name and --email, or --csv leads.csv")
 
-    client = anthropic.Anthropic()
+    client = make_client()
     print(f"Enriching {len(leads)} lead(s) with {MODEL}\n", file=sys.stderr)
     for lead in leads:
         try:

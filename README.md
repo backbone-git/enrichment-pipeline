@@ -80,9 +80,13 @@ data — generated without an API key for illustration).
 ## How it works
 
 1. **Research pass** — Claude (Opus 4.8) with the web-search tool builds a
-   written dossier on the lead.
-2. **Structure pass** — a second call extracts validated evidence fields
-   (listings, solds, team, tenure, socials).
+   written dossier on the lead. This is the judgment-heavy step (deciding
+   whether someone's genuinely an agent, weighing conflicting evidence), so
+   it stays on Opus.
+2. **Structure pass** — a second call (Haiku 4.5 — mechanical extraction
+   from a dossier Opus already wrote, doesn't need Opus-level reasoning)
+   extracts validated evidence fields (listings, solds, team, tenure,
+   socials).
 3. **Score** — Python applies the rubric above (deterministic, no model
    guessing on the final score) and assigns a priority.
 4. **Report** — writes the `.txt`.

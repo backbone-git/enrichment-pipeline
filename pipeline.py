@@ -26,7 +26,7 @@ import anthropic
 import ac_client
 import config
 import docs_client
-from enrich import Lead, enrich_one
+from enrich import Lead, enrich_one, make_client
 
 try:  # load ANTHROPIC_API_KEY / AC_API_URL / AC_API_KEY / Google config
     from dotenv import load_dotenv
@@ -77,14 +77,24 @@ def _note_body(result, extra_lines: List[str], doc_url: str) -> str:
         lines.append(f"Agency site: {ev.agency_website}")
     if ev.profile_url:
         lines.append(f"Agent profile: {ev.profile_url}")
-    yexp = ev.years_experience if ev.years_experience is not None else "unknown"
+    yexp = round(ev.years_experience) if ev.years_experience is not None else "unknown"
     lines.append(f"Experience: {yexp} years")
-    lines.append(
-        "Team: " + ("Yes" if (ev.has_team or ev.team_size) else "No / solo")
-        + (f" (~{ev.team_size} people)" if ev.team_size else "")
-    )
-    lines.append(f"Active listings: {ev.active_listings_count}")
-    lines.append(f"Sold in ~90 days: {ev.sold_last_90_days_count}")
+    if ev.has_team is None and not ev.team_size:
+        lines.append("Team: not confirmed")
+    else:
+        lines.append(
+            "Team: " + ("Yes" if (ev.has_team or ev.team_size) else "No / solo")
+            + (f" (~{ev.team_size} people)" if ev.team_size else "")
+        )
+    active = ev.active_listings_count if ev.active_listings_count is not None else "not confirmed"
+    sold = ev.sold_last_90_days_count if ev.sold_last_90_days_count is not None else "not confirmed"
+    lines.append(f"Active listings: {active}")
+    lines.append(f"Sold in ~90 days: {sold}")
+    if result.score.incomplete:
+        lines.append("")
+        lines.append("⚠ INCOMPLETE — one or more categories above could not be confirmed by the")
+        lines.append("research (e.g. search budget ran out). Score may be understated — worth a")
+        lines.append("manual look rather than trusting this priority as final.")
     lines.append("")
     lines.append(f"Full dossier: {doc_url}")
     return "\n".join(lines)
@@ -133,7 +143,7 @@ def process_contact(client: anthropic.Anthropic, contact: dict) -> None:
 
 
 def main():
-    client = anthropic.Anthropic()
+    client = make_client()
     contacts = ac_client.get_contacts_by_tag(config.TAG_PENDING)
     print(f"Found {len(contacts)} contact(s) tagged {config.TAG_PENDING!r}", file=sys.stderr)
     for contact in contacts:
