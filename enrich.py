@@ -208,8 +208,12 @@ without exhaustively chasing verification here.
 - Roughly how many years they have been an agent.
 - Their active social/professional profiles, if shown on these sites.
 
-Search by name plus likely qualifiers (real estate, the agency, the region). The email may be \
-a personal address, so don't rely on the email domain to find them. Be honest about uncertainty: \
+Search by name plus likely qualifiers (real estate, the agency, the region) — but also run at \
+least one search on the raw email address and, if given, the raw phone number, verbatim. These \
+often surface an agent's own listing/profile pages directly in the snippet (including specifics \
+like a stated active-listing count) that a name-only search misses. (Don't rely on the email \
+*domain* to guess an employer, though — a personal address like gmail.com tells you nothing.) Be \
+honest about uncertainty: \
 if you cannot find evidence the person is an agent on these sites, say so clearly rather than \
 guessing — they may still be a genuine agent who simply isn't well represented here, that's fine, \
 don't stretch to compensate. Cite the sources you used. End with a clear written dossier covering \
@@ -230,15 +234,29 @@ a claimed "current" profile page that errors out or looks removed when fetched i
 evidence the person has left that agency.
 - If you find a different, more recent agency than the one in the first pass, that supersedes it \
 — report the more recent one as current, and note the discrepancy explicitly.
-- Once the agency question is settled, if you have fetch budget left, spend it fetching the \
-person's Trade Me Property agent profile directly (trademe.co.nz/a/property/agent/<Name>) for an \
-accurate current listing count — Trade Me's own profile pages have proven reliable and complete \
-for this specifically, noticeably more so than a search-snippet estimate, which tends to \
-undercount. Note: RateMyAgent blocks direct fetching (returns a 403) — don't spend a fetch call \
-on it, only use it via search if it comes up. If there's still budget after that, also try to \
-fill in anything else the first pass flagged as not found or unconfirmed (recent sales, team, \
-social profiles) — but the agency question is always the priority; don't spend budget on anything \
-else at the expense of settling that one.
+- Once the agency question is settled, if you have fetch budget left, spend it confirming the \
+active listing count directly, from BOTH of these when a URL for them exists (from the first \
+pass's dossier, or find one): the person's Trade Me Property agent profile \
+(trademe.co.nz/a/property/agent/<Name>), and their realestate.co.nz agent profile \
+(realestate.co.nz/agent/<id>/<name>) — its page states the count outright (e.g. "Displaying 1-1, \
+out of 1 active listings"). Fetch both directly rather than trusting a search snippet or either \
+site's own summary/stats widget for this — observed directly: homes.co.nz's agent-stats data can \
+disagree with a live, freshly-fetched realestate.co.nz page (reporting 0 active listings when \
+realestate.co.nz's own page — fetched live, not cached — showed 1), so a single aggregator's \
+number, or a search snippet, isn't enough to call it "confirmed zero." If the two fetched pages \
+disagree, report the higher/more-specific figure as current and note the discrepancy explicitly \
+rather than silently picking one. Note: RateMyAgent blocks direct fetching (returns a 403) — \
+don't spend a fetch call on it, only use it via search if it comes up. If there's still budget \
+after that, also try to fill in anything else the first pass flagged as not found or unconfirmed \
+(recent sales, team, social profiles) — but the agency question is always the priority; don't \
+spend budget on anything else at the expense of settling that one.
+- For social profiles specifically, if you still have search calls left after everything above: \
+try one or two searches like site:instagram.com and site:facebook.com against their name plus \
+the confirmed agency (e.g. "Mel Farani Barfoot Thompson"). Only report a profile as theirs if the \
+bio/name in the result clearly matches this specific person (real-estate branding, their agency \
+name, their suburb) — common names return a lot of unrelated accounts, and an unverified guess is \
+worse than reporting none found. Skip this entirely if you're low on search calls; it's the \
+lowest-priority item in this pass.
 
 End with a written summary that clearly states the confirmed current agency and cites the source \
 that confirms it — or clearly states you could not confirm one, if that's the honest answer."""
@@ -419,8 +437,9 @@ def research_pass2(client: anthropic.Anthropic, lead: Lead, pass1_dossier: str) 
             "allowed_callers": ["direct"],  # see research_pass1 for why
         },
         # No per-use fee (token cost only, ~2,500 tokens for a typical page) — capped low since
-        # this is meant for targeted verification of a claimed "current agency" page, not broad
-        # fetching. max_content_tokens guards against an unexpectedly large page.
+        # this is meant for targeted verification (the claimed "current agency" page, plus up to
+        # two listing-count sources: Trade Me and realestate.co.nz), not broad fetching.
+        # max_content_tokens guards against an unexpectedly large page.
         #
         # use_cache=False matters a lot for what this tool is actually for here: by default
         # web_fetch may serve Anthropic's own cached copy of a page rather than the live one
@@ -434,7 +453,7 @@ def research_pass2(client: anthropic.Anthropic, lead: Lead, pass1_dossier: str) 
         {
             "type": "web_fetch_20260309",
             "name": "web_fetch",
-            "max_uses": 3,
+            "max_uses": 4,  # employer page + Trade Me + realestate.co.nz, plus one spare
             "max_content_tokens": 8000,
             "use_cache": False,
             "allowed_callers": ["direct"],
