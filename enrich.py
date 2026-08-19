@@ -144,7 +144,7 @@ class Evidence(BaseModel):
         default=None, description="null if not confirmed (e.g. search ran out before checking) — 0 only if confirmed to be zero"
     )
     recent_listings: List[Listing] = Field(default_factory=list)
-    sold_last_90_days_count: Optional[int] = Field(
+    sold_last_12_months_count: Optional[int] = Field(
         default=None, description="null if not confirmed (e.g. search ran out before checking) — 0 only if confirmed to be zero"
     )
     recent_sold: List[Listing] = Field(default_factory=list)
@@ -170,7 +170,7 @@ class Evidence(BaseModel):
     def _coerce_whole_number_fields(cls, data):
         if not isinstance(data, dict):
             return data
-        for key in ("active_listings_count", "sold_last_90_days_count", "team_size"):
+        for key in ("active_listings_count", "sold_last_12_months_count", "team_size"):
             value = data.get(key)
             if isinstance(value, float):
                 data[key] = round(value)
@@ -202,18 +202,26 @@ Investigate and gather concrete evidence for:
 - The agency/brokerage associated with them on these sites. This may be out of date — a separate \
 pass will specifically verify their CURRENT employer — so just report what these sites show \
 without exhaustively chasing verification here.
-- Their active listings right now (find 2-3 of the most recent, with address + price + link).
-- A recently sold listing (ideally within the last ~90 days).
+- Their active listings right now (find 2-3 of the most recent, with address + price + link). \
+Not being able to find their individual profile page on a listings site is NOT the same as \
+confirming they have zero listings — search coverage is imperfect and can miss a page that's \
+genuinely live. Only call it zero if you actually reach their specific page and it explicitly \
+shows none; otherwise it's simply not confirmed, and your dossier should say so plainly rather \
+than stating a number.
+- How many properties they've sold in the last 12 months, if a search snippet makes this clear \
+(find 1-2 examples too, not just the count). Be careful here: realestate.co.nz's sold page shows \
+an agent's ENTIRE sold history, not just the last 12 months, so a raw "N sold listings" figure \
+from a snippet is not the same as "N sold in the last 12 months" — don't report a specific number \
+unless the snippet itself makes the time window clear. This one is hard to pin down from search \
+snippets alone; it's fine to leave as not confirmed and let the second pass verify it properly \
+(it can fetch the page directly and check individual sold dates). Same distinction applies: no \
+page found is "not confirmed," not "zero."
 - Whether they work in a team and roughly how many people are with them.
 - Roughly how many years they have been an agent.
 - Their active social/professional profiles, if shown on these sites.
 
-Search by name plus likely qualifiers (real estate, the agency, the region) — but also run at \
-least one search on the raw email address and, if given, the raw phone number, verbatim. These \
-often surface an agent's own listing/profile pages directly in the snippet (including specifics \
-like a stated active-listing count) that a name-only search misses. (Don't rely on the email \
-*domain* to guess an employer, though — a personal address like gmail.com tells you nothing.) Be \
-honest about uncertainty: \
+Search by name plus likely qualifiers (real estate, the agency, the region). The email may be \
+a personal address, so don't rely on the email domain to find them. Be honest about uncertainty: \
 if you cannot find evidence the person is an agent on these sites, say so clearly rather than \
 guessing — they may still be a genuine agent who simply isn't well represented here, that's fine, \
 don't stretch to compensate. Cite the sources you used. End with a clear written dossier covering \
@@ -234,22 +242,34 @@ a claimed "current" profile page that errors out or looks removed when fetched i
 evidence the person has left that agency.
 - If you find a different, more recent agency than the one in the first pass, that supersedes it \
 — report the more recent one as current, and note the discrepancy explicitly.
-- Once the agency question is settled, if you have fetch budget left, spend it confirming the \
-active listing count directly, from BOTH of these when a URL for them exists (from the first \
-pass's dossier, or find one): the person's Trade Me Property agent profile \
-(trademe.co.nz/a/property/agent/<Name>), and their realestate.co.nz agent profile \
-(realestate.co.nz/agent/<id>/<name>) — its page states the count outright (e.g. "Displaying 1-1, \
-out of 1 active listings"). Fetch both directly rather than trusting a search snippet or either \
-site's own summary/stats widget for this — observed directly: homes.co.nz's agent-stats data can \
-disagree with a live, freshly-fetched realestate.co.nz page (reporting 0 active listings when \
-realestate.co.nz's own page — fetched live, not cached — showed 1), so a single aggregator's \
-number, or a search snippet, isn't enough to call it "confirmed zero." If the two fetched pages \
-disagree, report the higher/more-specific figure as current and note the discrepancy explicitly \
-rather than silently picking one. Note: RateMyAgent blocks direct fetching (returns a 403) — \
-don't spend a fetch call on it, only use it via search if it comes up. If there's still budget \
-after that, also try to fill in anything else the first pass flagged as not found or unconfirmed \
-(recent sales, team, social profiles) — but the agency question is always the priority; don't \
-spend budget on anything else at the expense of settling that one.
+- Once the agency question is settled, if you have fetch budget left, spend it confirming their \
+listing counts directly from their realestate.co.nz agent pages — the most reliably fetchable of \
+the aggregator sites (Trade Me's pages require JavaScript to render and return nothing useful to \
+a plain fetch, confirmed directly — don't spend a fetch call on Trade Me for this). Find their \
+realestate.co.nz agent profile (realestate.co.nz/agent/<id>/<name>) from the first pass's dossier, \
+or search for it if needed:
+  - Active listings: fetch the profile itself — it states the count outright (e.g. "Displaying \
+1-1, out of 1 active listings"). Don't trust a search snippet or homes.co.nz's own stats widget \
+instead — observed directly: homes.co.nz's agent-stats data can disagree with a live, \
+freshly-fetched realestate.co.nz page (reporting 0 active listings when realestate.co.nz's own \
+page showed 1).
+  - Sold in the last 12 months: fetch their .../sold page — but its own "out of N sold listings" \
+header is their ENTIRE sold history, not a 12-month figure (confirmed directly: one agent's page \
+showed "30 sold listings" spanning back over two years). Don't use that header number. Instead, \
+read the individual sold-date tag on each listing (e.g. "SOLD JUL 26", "SOLD MAY 24") and count \
+only the ones within the last 12 months from today. If the first page's oldest visible date is \
+already within 12 months, you may need to fetch page 2 (.../sold?page=2) to find where the \
+12-month cutoff falls — but don't spend more than one extra fetch chasing this if it's not clear \
+after that.
+IMPORTANT: not being able to find or fetch an individual profile page at all is NOT the same \
+thing as confirming zero — search coverage is imperfect and known to miss pages that do exist (a \
+specific agent's page can fail to surface in search even when it's live and has active listings \
+on it) — so treat "no profile page found" as simply unconfirmed. Only report zero when you \
+actually reach a page for this specific person and it explicitly shows zero. Note: RateMyAgent \
+blocks direct fetching (returns a 403) — don't spend a fetch call on it, only use it via search \
+if it comes up. If there's still budget after that, also try to fill in anything else the first \
+pass flagged as not found or unconfirmed (team, social profiles) — but the agency question is \
+always the priority; don't spend budget on anything else at the expense of settling that one.
 - For social profiles specifically, if you still have search calls left after everything above: \
 try one or two searches like site:instagram.com and site:facebook.com against their name plus \
 the confirmed agency (e.g. "Mel Farani Barfoot Thompson"). Only report a profile as theirs if the \
@@ -264,7 +284,7 @@ that confirms it — or clearly states you could not confirm one, if that's the 
 STRUCTURE_SYSTEM = """Extract the research dossier into a single JSON object. Only record facts \
 supported by the dossier; set is_real_estate_agent accordingly. Do not invent listings, teams, or tenure.
 
-For active_listings_count, sold_last_90_days_count, has_team, and team_size specifically: the dossier will \
+For active_listings_count, sold_last_12_months_count, has_team, and team_size specifically: the dossier will \
 often distinguish between "confirmed none" and "not confirmed / ran out of search budget before \
 checking" (e.g. it may say something was blocked by a search-tool limit, or that it simply wasn't \
 investigated). This distinction matters a lot downstream, so preserve it exactly:
@@ -273,6 +293,11 @@ investigated). This distinction matters a lot downstream, so preserve it exactly
     because a number wasn't stated.
   - Use a real 0 / false ONLY when the dossier explicitly states the count is zero / no team was \
     found, as an actual confirmed finding, not merely the absence of a number in the text.
+  - Specifically: the dossier saying it could not find/fetch the person's individual profile \
+    page on a listings site is NOT a confirmed zero, even if the dossier's own prose calls it \
+    "none found" or similar loose phrasing — that's a search miss, not a page that was reached \
+    and read as empty. Use `null` unless the dossier describes actually reaching a page \
+    specific to this person that itself shows zero.
 
 Return ONLY the JSON object (no prose, no markdown fences), with exactly this shape:
 {
@@ -284,7 +309,7 @@ Return ONLY the JSON object (no prose, no markdown fences), with exactly this sh
   "years_experience": null,
   "active_listings_count": null,
   "recent_listings": [{"address": "", "price": "", "url": ""}],
-  "sold_last_90_days_count": null,
+  "sold_last_12_months_count": null,
   "recent_sold": [{"address": "", "price": "", "url": ""}],
   "has_team": null,
   "team_size": null,
@@ -437,8 +462,10 @@ def research_pass2(client: anthropic.Anthropic, lead: Lead, pass1_dossier: str) 
             "allowed_callers": ["direct"],  # see research_pass1 for why
         },
         # No per-use fee (token cost only, ~2,500 tokens for a typical page) — capped low since
-        # this is meant for targeted verification (the claimed "current agency" page, plus up to
-        # two listing-count sources: Trade Me and realestate.co.nz), not broad fetching.
+        # this is meant for targeted verification (the claimed "current agency" page, plus their
+        # realestate.co.nz active + sold pages), not broad fetching. Trade Me is deliberately not
+        # a fetch target — confirmed directly its pages require JavaScript and return nothing
+        # useful to a plain fetch, so spending a call on it can only waste budget, never help.
         # max_content_tokens guards against an unexpectedly large page.
         #
         # use_cache=False matters a lot for what this tool is actually for here: by default
@@ -453,7 +480,7 @@ def research_pass2(client: anthropic.Anthropic, lead: Lead, pass1_dossier: str) 
         {
             "type": "web_fetch_20260309",
             "name": "web_fetch",
-            "max_uses": 4,  # employer page + Trade Me + realestate.co.nz, plus one spare
+            "max_uses": 3,  # employer page + realestate.co.nz active + realestate.co.nz sold
             "max_content_tokens": 8000,
             "use_cache": False,
             "allowed_callers": ["direct"],
@@ -479,9 +506,9 @@ def research_pass2(client: anthropic.Anthropic, lead: Lead, pass1_dossier: str) 
 # (recent_listings[i].price, social_profiles[i].url, etc.). Rather than
 # patch one field at a time as each new one surfaces after an
 # already-costly research call, sanitize generically before validation:
-_NULLABLE_EVIDENCE_FIELDS = {"active_listings_count", "sold_last_90_days_count", "has_team", "team_size", "years_experience"}
+_NULLABLE_EVIDENCE_FIELDS = {"active_listings_count", "sold_last_12_months_count", "has_team", "team_size", "years_experience"}
 _LIST_EVIDENCE_FIELDS = {"recent_listings", "recent_sold", "social_profiles"}
-_NUMERIC_EVIDENCE_FIELDS = {"active_listings_count", "sold_last_90_days_count", "team_size", "years_experience"}
+_NUMERIC_EVIDENCE_FIELDS = {"active_listings_count", "sold_last_12_months_count", "team_size", "years_experience"}
 
 
 def _sanitize_nulls(obj):
@@ -615,7 +642,7 @@ def score(ev: Evidence, lead: Lead) -> Score:
 
     add(20, f"Confirmed real-estate agent (confidence: {ev.confidence})")
 
-    # active_listings_count / sold_last_90_days_count / has_team are all
+    # active_listings_count / sold_last_12_months_count / has_team are all
     # Optional: None means the research didn't actually confirm the answer
     # (e.g. ran out of search budget), a real 0/false means it did and found
     # none. Unconfirmed categories are skipped rather than scored as zero —
@@ -631,13 +658,15 @@ def score(ev: Evidence, lead: Lead) -> Score:
     else:
         bd.append("    0  No active listings found (confirmed)")
 
-    if ev.sold_last_90_days_count is None:
+    if ev.sold_last_12_months_count is None:
         bd.append("   ??  Recent solds not confirmed (research incomplete)")
         unconfirmed.append("recent solds")
-    elif ev.sold_last_90_days_count >= 2:
-        add(20, f"{ev.sold_last_90_days_count} sold in ~last 90 days")
-    elif ev.sold_last_90_days_count >= 1:
-        add(10, f"{ev.sold_last_90_days_count} recent sold")
+    elif ev.sold_last_12_months_count >= 6:
+        add(20, f"{ev.sold_last_12_months_count} sold in last 12 months")
+    elif ev.sold_last_12_months_count >= 2:
+        add(10, f"{ev.sold_last_12_months_count} sold in last 12 months")
+    elif ev.sold_last_12_months_count == 1:
+        add(5, "1 sold in last 12 months")
     else:
         bd.append("    0  No recent solds found (confirmed)")
 
@@ -735,7 +764,7 @@ def render(lead: Lead, ev: Evidence, sc: Score, dossier: str) -> str:
         w(f"     - {x.address}{(' — ' + x.price) if x.price else ''}")
         if x.url:
             w(f"       {x.url}")
-    w(f"  Sold (~90 days): {ev.sold_last_90_days_count if ev.sold_last_90_days_count is not None else 'not confirmed'}")
+    w(f"  Sold (12 months): {ev.sold_last_12_months_count if ev.sold_last_12_months_count is not None else 'not confirmed'}")
     for x in ev.recent_sold:
         w(f"     - {x.address}{(' — ' + x.price) if x.price else ''}")
         if x.url:
