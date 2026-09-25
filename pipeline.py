@@ -18,7 +18,6 @@ Run standalone for a manual/local pass:
 Scheduled via .github/workflows/enrich.yml in production.
 """
 
-import os
 import sys
 from typing import List
 
@@ -147,16 +146,6 @@ def main():
     client = make_client()
     contacts = ac_client.get_contacts_by_tag(config.TAG_PENDING)
     print(f"Found {len(contacts)} contact(s) tagged {config.TAG_PENDING!r}", file=sys.stderr)
-
-    # Newest first, capped per run — each lead is a paid Opus research call,
-    # so a backlog shouldn't all be spent in one go. Anything past the cap
-    # keeps its tag and is picked up by a later run.
-    max_contacts = int(os.environ.get("MAX_CONTACTS_PER_RUN", "10"))
-    contacts.sort(key=lambda c: c.get("cdate", ""), reverse=True)
-    if len(contacts) > max_contacts:
-        print(f"Processing the newest {max_contacts}; the rest wait for a later run", file=sys.stderr)
-        contacts = contacts[:max_contacts]
-
     failed = 0
     for contact in contacts:
         try:
