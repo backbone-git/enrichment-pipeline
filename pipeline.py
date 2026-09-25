@@ -87,9 +87,9 @@ def _note_body(result, extra_lines: List[str], doc_url: str) -> str:
             + (f" (~{ev.team_size} people)" if ev.team_size else "")
         )
     active = ev.active_listings_count if ev.active_listings_count is not None else "not confirmed"
-    sold = ev.sold_last_90_days_count if ev.sold_last_90_days_count is not None else "not confirmed"
+    sold = ev.sold_last_12_months_count if ev.sold_last_12_months_count is not None else "not confirmed"
     lines.append(f"Active listings: {active}")
-    lines.append(f"Sold in ~90 days: {sold}")
+    lines.append(f"Sold in last 12 months: {sold}")
     if result.score.incomplete:
         lines.append("")
         lines.append("⚠ INCOMPLETE — one or more categories above could not be confirmed by the")
