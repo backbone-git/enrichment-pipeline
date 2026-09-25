@@ -5,6 +5,12 @@ on:
     - cron: "*/15 * * * *"
   workflow_dispatch: {}
 
+# One run at a time — overlapping runs would each pick up the same
+# "Pending Enrichment" contacts and enrich them twice.
+concurrency:
+  group: enrich-pipeline
+  cancel-in-progress: false
+
 jobs:
   run-pipeline:
     runs-on: ubuntu-latest
